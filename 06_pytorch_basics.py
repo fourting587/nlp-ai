@@ -711,8 +711,8 @@ print("""
 ✅ Part 9: 文本情感分类实战
 
 下一步 — Phase 6: NLP 项目实战
-  项目1: 中文情感分析 (PyTorch + BERT)
-  项目2: 智能问答机器人 (Transformer / RAG)
+  ✅ 项目1: 中文情感分析 (PyTorch + TextCNN)
+  ✅ 项目2: 智能问答机器人 (RAG + 混合检索)
   项目3: 文本摘要工具 (Seq2Seq / LLM)
 
 🔥 面试重点: 手写 Attention、Transformer 架构、CNN 原理
