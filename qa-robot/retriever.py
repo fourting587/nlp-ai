@@ -347,9 +347,45 @@ class HybridRetriever:
 
         return results
 
+    def add_documents(self, new_documents: List[Dict]):
+        """
+        增量添加文档并重建索引
+        （数据量小简单实现：追加后完全重建）
+        """
+        existing_ids = {d.get("id") for d in self.documents}
+        truly_new = [d for d in new_documents if d.get("id") not in existing_ids]
+
+        if not truly_new:
+            print("  [增量] 没有新文档需要添加")
+            return
+
+        print(f"  [增量] 添加 {len(truly_new)} 篇新文档")
+        self.documents.extend(truly_new)
+
+        # 重建索引
+        texts = [d.get("text", d.get("content", "")) for d in self.documents]
+        self.tfidf.build_index(self.documents, texts)
+        self.dense.build_index(self.documents, texts)
+        self.ready = True
+
+    def get_doc_hashes(self) -> Dict[str, str]:
+        """获取所有文档的 hash，用于检测变化"""
+        import hashlib
+        hashes = {}
+        for d in self.documents:
+            content = d.get("content", "")
+            h = hashlib.md5(content.encode()).hexdigest()
+            hashes[d["id"]] = h
+        return hashes
+
     def save(self, path: str):
         """保存索引"""
         import pickle
+        import hashlib
+        # 文档内容 hash 用于增量检测
+        content_hash = hashlib.md5(
+            "".join(d.get("content", "") for d in self.documents).encode()
+        ).hexdigest()
         data = {
             "documents": self.documents,
             "tfidf_vocab": self.tfidf.vocab,
@@ -361,6 +397,7 @@ class HybridRetriever:
             "dense_svd_Vt": self.dense.svd_Vt,
             "dense_svd_S": self.dense.svd_S,
             "alpha": self.alpha,
+            "content_hash": content_hash,
         }
         with open(path, "wb") as f:
             pickle.dump(data, f)

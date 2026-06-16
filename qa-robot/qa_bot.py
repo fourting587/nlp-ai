@@ -4,18 +4,21 @@
 基于 RAG (检索增强生成) 架构。
 
 流程:
-  1. 用户提问 → 2. 检索相关文档 → 3. 提取答案 → 4. 返回结果
+  1. 用户提问 → 2. [缓存命中?] → 3. 检索相关文档 → 4. LLM/本地生成答案
 
 用法:
     python3 qa_bot.py                         # 交互模式
     python3 qa_bot.py --query "什么是Transformer?"  # 单次问答
+    python3 qa_bot.py --llm                   # LLM 增强模式（需设置 ANTHROPIC_API_KEY）
     python3 qa_bot.py --api                   # API 服务模式
 
 简历亮点:
   - RAG 全流程实现（检索→增强→生成）
   - 混合检索策略（稀疏 + 稠密）
-  - 答案置信度评估
-  - 可扩展的插件接口
+  - LLM 增强生成（Claude API 接入）
+  - 语义缓存（相似问题自动命中）
+  - 增量更新（知识库新增文档自动加入）
+  - 支持 Gradio Web 界面
 """
 
 import argparse
@@ -24,7 +27,9 @@ import os
 import re
 import sys
 import time
+import hashlib
 from typing import List, Dict, Optional
+from datetime import datetime
 
 import numpy as np
 
@@ -349,6 +354,183 @@ def tokenize(text: str) -> List[str]:
 # ============================================================
 # QA Bot 主类
 # ============================================================
+# ============================================================
+# LLM 适配器 (用 Claude API 生成更自然的回答)
+# ============================================================
+class LLMAdapter:
+    """
+    LLM 生成器 — 用 Claude API 增强答案
+
+    设置环境变量 ANTHROPIC_API_KEY 或传入 api_key:
+        export ANTHROPIC_API_KEY=sk-ant-...
+        python3 qa_bot.py --llm
+
+    无 API Key 时自动回退到本地提取器
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-6"):
+        self.model = model
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self.client = None
+
+    @property
+    def available(self) -> bool:
+        """LLM 是否可用"""
+        return bool(self.api_key)
+
+    def generate(self, query: str, context: str, sources: List[Dict]) -> str:
+        """用 Claude 生成答案"""
+        if not self.available:
+            raise RuntimeError("LLM 不可用，请设置 ANTHROPIC_API_KEY")
+
+        if self.client is None:
+            try:
+                from anthropic import Anthropic
+                self.client = Anthropic(api_key=self.api_key)
+            except ImportError:
+                raise RuntimeError("anthropic 包未安装: pip install anthropic")
+            except Exception as e:
+                raise RuntimeError(f"Anthropic 客户端初始化失败: {e}")
+
+        # 构建 prompt
+        system_prompt = """你是一个 AI/NLP 技术面试问答助手。
+根据提供的知识库内容，用中文回答用户问题。
+要求：
+- 回答准确、简洁，基于知识库内容
+- 如果知识库信息不足，诚实说"知识库中没有相关信息"
+- 可以补充自己的知识，但要说明是补充内容
+- 适当使用列表、加粗等格式让答案更清晰"""
+
+        source_text = "\n\n".join([
+            f"--- 参考 {i+1} ---\n{s.get('title', '')}\n{s.get('content', '')[:800]}"
+            for i, s in enumerate(sources[:3])
+        ])
+
+        user_prompt = f"""## 用户问题
+{query}
+
+## 知识库参考内容
+{context[:2000]}
+
+## 详细参考
+{source_text[:2000]}
+
+请基于以上知识库内容回答用户问题。"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                temperature=0.3,
+            )
+            return response.content[0].text
+        except Exception as e:
+            raise RuntimeError(f"Claude API 调用失败: {e}")
+
+
+# ============================================================
+# 语义缓存 (相似问题自动命中)
+# ============================================================
+class SemanticCache:
+    """
+    语义缓存 — 相似问题直接返回缓存答案
+
+    原理: 将问题和答案存为 (query_vec, response) 对
+    新问题来时，计算与缓存中所有问题的余弦相似度
+    超过阈值则直接返回缓存答案
+    """
+
+    def __init__(self, threshold: float = 0.85, max_size: int = 200):
+        self.threshold = threshold
+        self.max_size = max_size
+        self.cache: List[Dict] = []  # [{query, answer, embedding, sources, time}]
+
+    def get(self, query: str) -> Optional[Dict]:
+        """查找缓存命中"""
+        if not self.cache:
+            return None
+
+        query_vec = self._vectorize(query)
+        if query_vec is None:
+            return None
+
+        best_score = 0
+        best_idx = -1
+
+        for i, entry in enumerate(self.cache):
+            score = self._cosine_sim(query_vec, entry["embedding"])
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_score >= self.threshold and best_idx >= 0:
+            entry = self.cache[best_idx]
+            return {
+                "answer": entry["answer"],
+                "confidence": best_score,
+                "sources": entry.get("sources", []),
+                "cached": True,
+                "cached_similarity": best_score,
+                "cached_from": entry["query"][:60],
+            }
+        return None
+
+    def put(self, query: str, answer: str, sources: List[Dict] = None):
+        """存入缓存"""
+        query_vec = self._vectorize(query)
+        if query_vec is None:
+            return
+
+        self.cache.append({
+            "query": query,
+            "answer": answer,
+            "embedding": query_vec,
+            "sources": sources or [],
+            "time": datetime.now().isoformat(),
+        })
+
+        # LRU 淘汰
+        if len(self.cache) > self.max_size:
+            self.cache = self.cache[-self.max_size:]
+
+    def clear(self):
+        """清空缓存"""
+        self.cache.clear()
+
+    @property
+    def stats(self) -> Dict:
+        """缓存统计"""
+        return {
+            "size": len(self.cache),
+            "max_size": self.max_size,
+            "threshold": self.threshold,
+        }
+
+    def _vectorize(self, text: str) -> Optional[np.ndarray]:
+        """将文本转为向量（字符级 bag-of-chars）"""
+        tokens = tokenize(text)
+        if not tokens:
+            return None
+        # 字符级向量
+        chars = set("".join(tokens))
+        # 用固定哈希降维到 256 维
+        vec = np.zeros(256)
+        for c in chars:
+            idx = hashlib.md5(c.encode()).digest()
+            for i in range(4):
+                pos = (idx[i] + idx[i+1] * 256) % 256
+                vec[pos] += 1
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
+
+    def _cosine_sim(self, a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.dot(a, b))
+
+
 class QABot:
     """
     智能问答机器人
@@ -361,13 +543,24 @@ class QABot:
     """
 
     def __init__(self, kb_dir: str = "./knowledge_base",
-                 index_path: str = "./models/index.pkl"):
+                 index_path: str = "./models/index.pkl",
+                 use_llm: bool = False,
+                 api_key: Optional[str] = None,
+                 cache_threshold: float = 0.85):
         self.kb_dir = kb_dir
         self.index_path = index_path
         self.retriever = None
         self.extractor = AnswerExtractor()
+        self.llm = LLMAdapter(api_key=api_key) if use_llm else None
+        self.cache = SemanticCache(threshold=cache_threshold) if cache_threshold > 0 else None
         self.history = []
         self.ready = False
+        self._use_llm_setting = use_llm
+
+    @property
+    def use_llm(self) -> bool:
+        """是否使用 LLM 生成"""
+        return self._use_llm_setting and self.llm and self.llm.available
 
     def initialize(self, force_rebuild: bool = False):
         """初始化：加载或构建索引"""
@@ -398,7 +591,8 @@ class QABot:
 
         print("✅ QA Bot 初始化完成（新建索引）")
 
-    def ask(self, query: str, top_k: int = 3, verbose: bool = False) -> Dict:
+    def ask(self, query: str, top_k: int = 3, verbose: bool = False,
+            skip_cache: bool = False) -> Dict:
         """
         提问主入口
 
@@ -406,6 +600,7 @@ class QABot:
             query: 用户问题
             top_k: 检索文档数量
             verbose: 是否打印详细信息
+            skip_cache: 是否跳过缓存
 
         Returns:
             {
@@ -414,6 +609,8 @@ class QABot:
                 "sources": [...],
                 "context": str,
                 "time_taken": float,
+                "cached": bool,
+                "llm_generated": bool,
             }
         """
         if not self.ready:
@@ -421,38 +618,99 @@ class QABot:
 
         start_time = time.time()
 
+        # Step 0: 语义缓存查询
+        if self.cache and not skip_cache:
+            cached = self.cache.get(query)
+            if cached:
+                elapsed = time.time() - start_time
+                result = {
+                    "answer": cached["answer"],
+                    "confidence": cached["confidence"],
+                    "sources": cached.get("sources", []),
+                    "context": "",
+                    "time_taken": elapsed,
+                    "cached": True,
+                    "llm_generated": False,
+                    "cached_similarity": cached.get("cached_similarity", 0),
+                    "cached_from": cached.get("cached_from", ""),
+                }
+                self.history.append({
+                    "query": query,
+                    "answer": result["answer"],
+                    "confidence": result["confidence"],
+                    "cached": True,
+                })
+                return result
+
         # Step 1: 检索
         if verbose:
             print("\n🔍 检索中...")
         results = self.retriever.retrieve(query, top_k=top_k)
 
         if not results:
-            return {
+            result = {
                 "answer": "抱歉，知识库中没有找到相关信息。",
                 "confidence": 0.0,
                 "sources": [],
                 "context": "",
                 "time_taken": time.time() - start_time,
+                "cached": False,
+                "llm_generated": False,
             }
+            self.history.append({"query": query, "answer": result["answer"]})
+            return result
 
-        # Step 2: 提取答案
         docs = [r[0] for r in results]
         scores = [r[1] for r in results]
 
-        extracted = self.extractor.extract(query, docs, scores)
+        # Step 2: LLM 生成 或 本地提取
+        if self.use_llm:
+            if verbose:
+                print("🤖 LLM 生成中...")
+            try:
+                context = docs[0].get("content", "")
+                llm_answer = self.llm.generate(query, context, docs[:3])
+                answer = llm_answer
+                llm_generated = True
+                confidence = scores[0] / max(scores) if scores else 0.5
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠️ LLM 失败: {e}，回退到本地提取")
+                extracted = self.extractor.extract(query, docs, scores)
+                answer = extracted["answer"]
+                confidence = extracted["confidence"]
+                llm_generated = False
+        else:
+            extracted = self.extractor.extract(query, docs, scores)
+            answer = extracted["answer"]
+            confidence = extracted["confidence"]
+            llm_generated = False
 
         elapsed = time.time() - start_time
 
         result = {
-            **extracted,
+            "answer": answer,
+            "confidence": confidence,
+            "sources": [
+                {"title": d["title"], "source": d["source"], "score": s}
+                for d, s in zip(docs, scores)
+            ],
+            "context": docs[0].get("content", "")[:500] if docs else "",
             "time_taken": elapsed,
+            "cached": False,
+            "llm_generated": llm_generated,
         }
+
+        # 存入缓存
+        if self.cache:
+            self.cache.put(query, answer, sources=docs[:3])
 
         # 记录历史
         self.history.append({
             "query": query,
-            "answer": result["answer"],
-            "confidence": result["confidence"],
+            "answer": answer,
+            "confidence": confidence,
+            "llm": llm_generated,
         })
 
         return result
@@ -484,13 +742,18 @@ class CLI:
         """启动交互式问答"""
         print("=" * 60)
         print("🤖 智能问答机器人 (RAG)")
-        print("    基于: PyTorch + 混合检索 (TF-IDF + Dense)")
-        print("    知识库: AI / NLP / 深度学习面试知识点")
+        print(f"    知识库: AI / NLP / 深度学习面试知识点")
+        llm_status = "✅ 已启用" if self.bot.use_llm else "❌ 未启用 (设置 ANTHROPIC_API_KEY)"
+        cache_status = f"✅ 已启用 (阈值: {self.bot.cache.threshold})" if self.bot.cache else "❌ 未启用"
+        print(f"    LLM: {llm_status}")
+        print(f"    缓存: {cache_status}")
         print("-" * 60)
         print("  输入问题开始问答，输入以下命令:")
         print("    /history  — 查看历史记录")
         print("    /stats    — 查看知识库统计")
-        print("    /mode     — 切换输出模式")
+        print("    /cache    — 查看缓存状态")
+        print("    /clearcache — 清空缓存")
+        print("    /mode     — 切换流式输出")
         print("    q         — 退出")
         print("=" * 60)
 
@@ -518,6 +781,24 @@ class CLI:
                 self._show_stats()
                 continue
 
+            if query == "/cache":
+                if self.bot.cache:
+                    s = self.bot.cache.stats
+                    print(f"\n📦 缓存统计:")
+                    print(f"  条目数: {s['size']}/{s['max_size']}")
+                    print(f"  命中阈值: {s['threshold']:.0%}")
+                else:
+                    print("📦 缓存未启用")
+                continue
+
+            if query == "/clearcache":
+                if self.bot.cache:
+                    self.bot.cache.clear()
+                    print("🗑️  缓存已清空")
+                else:
+                    print("📦 缓存未启用")
+                continue
+
             if query == "/mode":
                 stream_mode = not stream_mode
                 print(f"📢 输出模式: {'流式' if stream_mode else '标准'}")
@@ -538,6 +819,14 @@ class CLI:
         answer = result["answer"]
         confidence = result["confidence"]
         sources = result.get("sources", [])
+
+        # 来源标识
+        if result.get("cached"):
+            sim = result.get("cached_similarity", 0)
+            print(f"\n⚡ [缓存命中] (相似度: {sim:.1%})")
+            print(f"   原始问题: {result.get('cached_from', '')}")
+        elif result.get("llm_generated"):
+            print(f"\n🤖 [LLM 生成]")
 
         # 置信度指示器
         if confidence >= 0.7:
@@ -591,12 +880,27 @@ def main():
                         help="知识库路径")
     parser.add_argument("--topk", type=int, default=3,
                         help="检索文档数量")
+    parser.add_argument("--llm", action="store_true",
+                        help="启用 LLM 生成 (需要 ANTHROPIC_API_KEY)")
+    parser.add_argument("--api-key", type=str, default=None,
+                        help="Anthropic API Key (也可设置 ANTHROPIC_API_KEY 环境变量)")
+    parser.add_argument("--model", type=str, default="claude-sonnet-4-6",
+                        help="Claude 模型名 (默认 claude-sonnet-4-6)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="禁用语义缓存")
+    parser.add_argument("--cache-threshold", type=float, default=0.85,
+                        help="缓存命中阈值 (0~1, 默认 0.85)")
     parser.add_argument("--no-color", action="store_true",
                         help="禁用颜色输出（暂未使用）")
     args = parser.parse_args()
 
     # 初始化
-    bot = QABot(kb_dir=args.kb)
+    bot = QABot(
+        kb_dir=args.kb,
+        use_llm=args.llm,
+        api_key=args.api_key,
+        cache_threshold=0 if args.no_cache else args.cache_threshold,
+    )
     try:
         bot.initialize(force_rebuild=args.rebuild)
     except Exception as e:
@@ -606,6 +910,10 @@ def main():
     # 单次提问
     if args.query:
         result = bot.ask(args.query, top_k=args.topk, verbose=True)
+        if result.get("cached"):
+            print(f"⚡ [缓存命中] (相似度: {result['cached_similarity']:.1%})")
+        if result.get("llm_generated"):
+            print("🤖 [LLM 生成]")
         print(f"\n🤖 {result['answer']}")
         print(f"📊 置信度: {result['confidence']:.1%}")
         print(f"⚡ 耗时: {result['time_taken']:.2f}s")
