@@ -1,10 +1,11 @@
-# 智能问答机器人 (RAG-based Q&A Bot)
+# 智能问答机器人 (RAG + Web Search)
 
-基于 **RAG (Retrieval-Augmented Generation)** 架构的中文智能问答系统。
-可回答深度学习、NLP、Transformer、PyTorch 等技术面试问题。
+基于 **RAG (Retrieval-Augmented Generation)** 架构的中文智能问答系统，
+支持**联网搜索**，可回答任意领域问题。
 
 ## 项目亮点
 
+- 🌐 **联网搜索** — 切换至 Web 模式后可回答**任何问题**（不限知识库）
 - 🧠 **RAG 全流程** — 检索 → 增强 → 生成，工业级架构
 - 🔍 **混合检索** — TF-IDF（精确匹配）+ Dense Embedding（语义匹配）加权融合
 - 🤖 **LLM 接入** — 可选 Claude API 生成更自然的回答
@@ -33,12 +34,16 @@ python3 app.py
 ### CLI 交互模式
 
 ```bash
-python3 qa_bot.py
+python3 qa_bot.py                  # 知识库模式（AI/NLP 面试问答）
+python3 qa_bot.py --web            # 联网搜索模式（回答任意问题）
 ```
+
+启动后输入 `/web` 可在两种模式间切换。
 
 内置命令:
 | 命令 | 功能 |
 |------|------|
+| `/web` | 切换知识库/联网搜索模式 |
 | `/history` | 查看问答历史 |
 | `/stats` | 知识库统计 |
 | `/cache` | 缓存状态 |
@@ -64,9 +69,10 @@ python3 app.py --llm    # Web 界面启用 LLM
 ### Web 界面
 
 ```bash
-python3 app.py                # 默认 7860 端口
-python3 app.py --port 8080    # 自定义端口
-python3 app.py --share        # 生成公网链接
+python3 app.py                     # 知识库模式
+python3 app.py --web               # 启动时默认开启联网搜索
+python3 app.py --port 8080         # 自定义端口
+python3 app.py --share             # 生成公网链接
 ```
 
 ### 增量更新

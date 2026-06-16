@@ -546,16 +546,24 @@ class QABot:
                  index_path: str = "./models/index.pkl",
                  use_llm: bool = False,
                  api_key: Optional[str] = None,
-                 cache_threshold: float = 0.85):
+                 cache_threshold: float = 0.85,
+                 use_web: bool = False):
         self.kb_dir = kb_dir
         self.index_path = index_path
         self.retriever = None
         self.extractor = AnswerExtractor()
         self.llm = LLMAdapter(api_key=api_key) if use_llm else None
         self.cache = SemanticCache(threshold=cache_threshold) if cache_threshold > 0 else None
+        self.web_agent = None
         self.history = []
         self.ready = False
         self._use_llm_setting = use_llm
+        self._use_web_setting = use_web
+
+    @property
+    def use_web(self) -> bool:
+        """是否使用联网搜索"""
+        return self._use_web_setting
 
     @property
     def use_llm(self) -> bool:
@@ -642,9 +650,31 @@ class QABot:
                 })
                 return result
 
-        # Step 1: 检索
+        # Step 1: 联网搜索模式
+        if self.use_web:
+            if self.web_agent is None:
+                from web_agent import WebAgent
+                self.web_agent = WebAgent()
+            web_result = self.web_agent.ask(query, verbose=verbose)
+            elapsed = time.time() - start_time
+            result = {
+                "answer": web_result["answer"],
+                "confidence": 0.8 if web_result["source_count"] > 0 else 0.0,
+                "sources": [{"title": s["title"], "url": s["url"], "score": 1.0}
+                            for s in web_result["sources"]],
+                "context": "",
+                "time_taken": elapsed,
+                "cached": False,
+                "llm_generated": False,
+                "web_sourced": True,
+            }
+            self.history.append({"query": query, "answer": result["answer"],
+                                 "web": True})
+            return result
+
+        # Step 2: 知识库检索
         if verbose:
-            print("\n🔍 检索中...")
+            print("\n🔍 知识库检索中...")
         results = self.retriever.retrieve(query, top_k=top_k)
 
         if not results:
@@ -656,6 +686,7 @@ class QABot:
                 "time_taken": time.time() - start_time,
                 "cached": False,
                 "llm_generated": False,
+                "web_sourced": False,
             }
             self.history.append({"query": query, "answer": result["answer"]})
             return result
@@ -699,6 +730,7 @@ class QABot:
             "time_taken": elapsed,
             "cached": False,
             "llm_generated": llm_generated,
+            "web_sourced": False,
         }
 
         # 存入缓存
@@ -743,16 +775,19 @@ class CLI:
         print("=" * 60)
         print("🤖 智能问答机器人 (RAG)")
         print(f"    知识库: AI / NLP / 深度学习面试知识点")
-        llm_status = "✅ 已启用" if self.bot.use_llm else "❌ 未启用 (设置 ANTHROPIC_API_KEY)"
-        cache_status = f"✅ 已启用 (阈值: {self.bot.cache.threshold})" if self.bot.cache else "❌ 未启用"
-        print(f"    LLM: {llm_status}")
-        print(f"    缓存: {cache_status}")
+        llm_status = "✅" if self.bot.use_llm else "❌"
+        web_status = "✅" if self.bot.use_web else "❌"
+        cache_status = f"✅ (阈值: {self.bot.cache.threshold})" if self.bot.cache else "❌"
+        print(f"    LLM 增强:   {llm_status}")
+        print(f"    联网搜索:   {web_status}")
+        print(f"    语义缓存:   {cache_status}")
         print("-" * 60)
         print("  输入问题开始问答，输入以下命令:")
         print("    /history  — 查看历史记录")
         print("    /stats    — 查看知识库统计")
         print("    /cache    — 查看缓存状态")
         print("    /clearcache — 清空缓存")
+        print("    /web      — 切换联网搜索模式")
         print("    /mode     — 切换流式输出")
         print("    q         — 退出")
         print("=" * 60)
@@ -804,6 +839,12 @@ class CLI:
                 print(f"📢 输出模式: {'流式' if stream_mode else '标准'}")
                 continue
 
+            if query == "/web":
+                self.bot._use_web_setting = not self.bot._use_web_setting
+                status = "🌐 联网搜索" if self.bot._use_web_setting else "📚 知识库"
+                print(f"📢 切换至: {status} 模式")
+                continue
+
             # 问答
             print("\n🤔 思考中...", end="\r")
 
@@ -825,6 +866,8 @@ class CLI:
             sim = result.get("cached_similarity", 0)
             print(f"\n⚡ [缓存命中] (相似度: {sim:.1%})")
             print(f"   原始问题: {result.get('cached_from', '')}")
+        elif result.get("web_sourced"):
+            print(f"\n🌐 [联网搜索]")
         elif result.get("llm_generated"):
             print(f"\n🤖 [LLM 生成]")
 
@@ -841,9 +884,17 @@ class CLI:
         print(f"⚡ 耗时: {result.get('time_taken', 0):.2f}s")
 
         if sources:
-            print(f"📚 参考来源 ({len(sources)} 篇):")
-            for src in sources[:3]:
-                print(f"   · {src['title']} (score={src['score']:.3f})")
+            if result.get("web_sourced"):
+                print(f"🌐 来源 ({len(sources)} 个):")
+                for src in sources[:3]:
+                    url = src.get("url", "")
+                    print(f"   · {src['title']}")
+                    if url:
+                        print(f"     {url}")
+            else:
+                print(f"📚 参考来源 ({len(sources)} 篇):")
+                for src in sources[:3]:
+                    print(f"   · {src['title']} (score={src['score']:.3f})")
 
     def _show_history(self):
         """显示问答历史"""
@@ -890,6 +941,8 @@ def main():
                         help="禁用语义缓存")
     parser.add_argument("--cache-threshold", type=float, default=0.85,
                         help="缓存命中阈值 (0~1, 默认 0.85)")
+    parser.add_argument("--web", action="store_true",
+                        help="启用联网搜索（可回答任何问题）")
     parser.add_argument("--no-color", action="store_true",
                         help="禁用颜色输出（暂未使用）")
     args = parser.parse_args()
@@ -900,6 +953,7 @@ def main():
         use_llm=args.llm,
         api_key=args.api_key,
         cache_threshold=0 if args.no_cache else args.cache_threshold,
+        use_web=args.web,
     )
     try:
         bot.initialize(force_rebuild=args.rebuild)
