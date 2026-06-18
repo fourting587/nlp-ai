@@ -1,42 +1,21 @@
-# 智能问答机器人：基于 RAG 的检索增强生成系统
+# 智能问答机器人 (RAG + Web Search)
 
-> **Python · TF-IDF · Sentence-Transformer · Gradio · Claude API**
+基于 **RAG (Retrieval-Augmented Generation)** 架构的中文智能问答系统，
+支持**联网搜索**，可回答任意领域问题。
 
-独立设计和实现的端到端 RAG 智能问答系统，支持**知识库问答**和**联网搜索**两种模式。包含完整的索引构建、混合检索、答案生成、语义缓存链路，配有 Gradio Web 界面。
+## 项目亮点
 
----
+- 🌐 **联网搜索** — 切换至 Web 模式后可回答**任何问题**（不限知识库）
+- 🧠 **RAG 全流程** — 检索 → 增强 → 生成，工业级架构
+- 🔍 **混合检索** — TF-IDF（精确匹配）+ Dense Embedding（语义匹配）加权融合
+- 🤖 **LLM 接入** — 可选 Claude API 生成更自然的回答
+- 💾 **语义缓存** — 相似问题自动缓存命中，秒级响应
+- 🌐 **Web 界面** — Gradio 聊天 UI，支持示例问题和 LLM 切换
+- 📚 **7 篇知识库** — 深度学习、Transformer、NLP、PyTorch、ML 算法、LeetCode、面试准备
+- 🔄 **增量更新** — 知识库新增文档时自动检测并更新索引
+- 🚫 **完全离线** — 基础模式无需下载任何模型或数据
 
-## ✨ 项目亮点（面向简历）
-
-### 核心技术
-
-| 模块 | 实现 |
-|------|------|
-| **混合检索** | 从零手写 TF-IDF 稀疏检索 + Dense Embedding 语义检索（Sentence-Transformer），权重 α 融合，兼顾精确匹配与语义相似度 |
-| **RAG 全流程** | 文档按标题分块 → 双路索引构建 → 混合检索 Top-K → 子节级答案提取（关键词重叠评分 + 置信度评估）→ 生成答案 |
-| **语义缓存** | 基于嵌入向量 + 余弦相似度的缓存机制，阈值 0.85 下相似问题直接命中，响应时间从 ~2s 降至毫秒级 |
-| **联网搜索** | 集成 DuckDuckGo Search API，支持知识库 / 联网双模式自由切换 |
-| **LLM 增强** | 接入 Claude API 增强生成质量，API 不可用时自动回退到本地提取模式 |
-| **Gradio Web UI** | 响应式聊天界面，支持模式切换、示例问题、LLM 开关、公网链接分享 |
-| **增量索引** | 基于文档 ID 检测的增量构建 + 文件系统监听模式（--watch 每 30s），无需全量重建 |
-
-### 知识库
-
-构建了 **7 篇 AI/NLP 面试知识库文档**（深度学习、Transformer、NLP 基础、PyTorch、ML 算法、Python 编程、面试准备），覆盖 ~70+ 知识点。
-
-### 架构设计
-
-```
-用户提问 → [语义缓存?] → 混合检索 → LLM/本地生成 → 返回 + 缓存
-            ↑               ↑
-       命中直接返回    TF-IDF + Dense
-```
-
-代码五模块解耦：`qa_bot.py` / `retriever.py` / `build_index.py` / `app.py` / `web_agent.py`
-
----
-
-## 🚀 快速开始
+## 快速开始
 
 ```bash
 # 1. 构建索引（含 7 篇知识库文档）
@@ -144,7 +123,6 @@ qa-robot/
 ├── retriever.py        # 检索模块 (TF-IDF + Dense + Hybrid)
 ├── build_index.py      # 索引构建 (全量/增量/监听)
 ├── app.py              # Gradio Web 界面
-├── web_agent.py        # 联网搜索模块
 ├── knowledge_base/     # 知识库 (7 篇 Markdown 文档)
 │   ├── 01_deep_learning.md
 │   ├── 02_transformer.md
